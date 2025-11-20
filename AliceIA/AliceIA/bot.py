@@ -151,10 +151,11 @@ class HistoricoCiclico:
 
 historico = HistoricoCiclico()
 
-# ========= SISTEMA DE MÚSICA =========
+# ========= SISTEMA DE MÚSICA CORRIGIDO =========
 fila_musica = {}
 tocando_relacionadas = {}
 
+# CONFIGURAÇÃO OTIMIZADA PARA MÚSICAS
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -166,7 +167,14 @@ ytdl_format_options = {
     'quiet': True,
     'no_warnings': True,
     'default_search': 'auto',
-    'source_address': '0.0.0.0'
+    'source_address': '0.0.0.0',
+    # FILTROS PARA EVITAR CONTEÚDO INADEQUADO
+    'match_filter': lambda info, incomplete: None if (
+        any(palavra in info.get('title', '').lower() for palavra in [
+            'podcast', 'interview', 'lecture', 'talk', 'speech', 'documentary',
+            'news', 'movie', 'trailer', 'gameplay', 'live', 'stream'
+        ]) or info.get('duration', 0) > 3600  # Mais de 1 hora
+    ) else None
 }
 
 ffmpeg_options = {
@@ -186,41 +194,101 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=True):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-        if 'entries' in data: data = data['entries'][0]
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+            
+            if 'entries' in data:
+                # Para buscas, pegar o primeiro resultado válido
+                for entry in data['entries']:
+                    if entry and self._eh_musica_valida(entry):
+                        data = entry
+                        break
+                else:
+                    # Se não encontrou música válida, pega o primeiro
+                    data = data['entries'][0] if data['entries'] else data
+            
+            filename = data['url'] if stream else ytdl.prepare_filename(data)
+            return cls(FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        except Exception as e:
+            print(f"❌ Erro ao processar URL: {e}")
+            raise
+    
+    @staticmethod
+    def _eh_musica_valida(entry):
+        """Verifica se o conteúdo parece ser uma música"""
+        if not entry:
+            return False
+            
+        title = entry.get('title', '').lower()
+        duration = entry.get('duration', 0)
+        
+        # Palavras que indicam NÃO ser música
+        palavras_proibidas = [
+            'podcast', 'interview', 'lecture', 'talk', 'speech', 'documentary',
+            'news', 'movie', 'trailer', 'gameplay', 'live', 'stream', 'full album',
+            'album completo', 'audiobook', 'asmr', 'sleep', 'meditation'
+        ]
+        
+        # Verificar se é música (duração razoável e não contém palavras proibidas)
+        return (
+            duration <= 1200 and  # Até 20 minutos
+            duration >= 60 and    # Pelo menos 1 minuto
+            not any(palavra in title for palavra in palavras_proibidas)
+        )
 
 async def buscar_musicas_relacionadas(titulo):
+    """Busca apenas músicas relacionadas"""
     try:
+        # Adicionar "música" na busca para melhorar resultados
+        query = f"ytsearch5:{titulo} official music audio"
+        
         data = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ytdl.extract_info(f"ytsearch5:{titulo} música oficial", download=False)
+            None, lambda: ytdl.extract_info(query, download=False)
         )
+        
         musicas = []
-        for entry in data.get('entries', [])[:3]:
-            if entry and entry.get('url'):
-                musicas.append({'title': entry.get('title', 'Música'), 'url': entry.get('url')})
+        for entry in data.get('entries', []):
+            if entry and entry.get('url') and YTDLSource._eh_musica_valida(entry):
+                musicas.append({
+                    'title': entry.get('title', 'Música'),
+                    'url': entry.get('url'),
+                    'duration': entry.get('duration', 0)
+                })
+                if len(musicas) >= 3:  # Limitar a 3 músicas
+                    break
+        
         return musicas
-    except: return []
+    except Exception as e:
+        print(f"❌ Erro ao buscar músicas relacionadas: {e}")
+        return []
 
 async def tocar_proxima(ctx, voice_client):
     guild_id = ctx.guild.id
-    if guild_id not in fila_musica or not fila_musica[guild_id]:
-        if guild_id in tocando_relacionadas and tocando_relacionadas[guild_id]:
-            if voice_client and voice_client.is_connected():
-                await ctx.send("🎵 **Modo Relacionadas Ativo!**")
-                player = await YTDLSource.from_url(tocando_relacionadas[guild_id].pop(0), loop=bot.loop, stream=True)
-                def after_playing(error):
-                    if not error: asyncio.run_coroutine_threadsafe(tocar_proxima(ctx, voice_client), bot.loop)
-                voice_client.play(player, after=after_playing)
-                await ctx.send(f"🎶 **Tocando (Relacionada):** {player.title}")
+    
+    # Primeiro tentar tocar da fila principal
+    if guild_id in fila_musica and fila_musica[guild_id]:
+        player = fila_musica[guild_id].pop(0)
+        def after_playing(error):
+            if not error:
+                asyncio.run_coroutine_threadsafe(tocar_proxima(ctx, voice_client), bot.loop)
+        voice_client.play(player, after=after_playing)
+        await ctx.send(f"🎶 **Tocando:** {player.title}")
         return
     
-    player = fila_musica[guild_id].pop(0)
-    def after_playing(error):
-        if not error: asyncio.run_coroutine_threadsafe(tocar_proxima(ctx, voice_client), bot.loop)
-    voice_client.play(player, after=after_playing)
-    await ctx.send(f"🎶 **Tocando:** {player.title}")
+    # Depois tentar músicas relacionadas
+    if guild_id in tocando_relacionadas and tocando_relacionadas[guild_id]:
+        if voice_client and voice_client.is_connected():
+            await ctx.send("🎵 **Modo Relacionadas Ativo!**")
+            player = await YTDLSource.from_url(tocando_relacionadas[guild_id].pop(0), loop=bot.loop, stream=True)
+            def after_playing_rel(error):
+                if not error:
+                    asyncio.run_coroutine_threadsafe(tocar_proxima(ctx, voice_client), bot.loop)
+            voice_client.play(player, after=after_playing_rel)
+            await ctx.send(f"🎶 **Tocando (Relacionada):** {player.title}")
+        return
+    
+    # Se não há mais nada para tocar
+    await ctx.send("🏁 **Fila vazia!** Use `!play` para adicionar mais músicas.")
 
 # ========= SISTEMA DE MÍDIA OTIMIZADO =========
 async def buscar_imagem(tema):
@@ -248,27 +316,9 @@ async def buscar_imagem(tema):
         return None
 
 async def buscar_gif(tema):
-    """Sistema CORRIGIDO para buscar GIFs usando API do Giphy"""
+    """Sistema CORRIGIDO para buscar GIFs sem API problemática"""
     try:
-        # API Key pública do Giphy (funciona para testes básicos)
-        API_KEY = "dc6zaTOxFJmzC"
-        
-        # Fazer busca na API do Giphy
-        url = f"https://api.giphy.com/v1/gifs/search?api_key={API_KEY}&q={tema}&limit=10&rating=g"
-        
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            dados = response.json()
-            
-            if dados.get('data') and len(dados['data']) > 0:
-                gif_aleatorio = random.choice(dados['data'])
-                url_gif = gif_aleatorio['images']['original']['url']
-                print(f"✅ GIF encontrado via API: {url_gif}")
-                return url_gif
-        
-        # Fallback para GIFs temáticos fixos
-        print("⚠️ API do Giphy falhou, usando fallback...")
+        # Fallback direto para GIFs temáticos sem API
         gifs_tematicos = {
             "cachorro": [
                 "https://media.giphy.com/media/3o72FfM5HJydzafgUE/giphy.gif",
@@ -298,6 +348,14 @@ async def buscar_gif(tema):
             "programacao": [
                 "https://media.giphy.com/media/13HgwGsXF0aiGY/giphy.gif",
                 "https://media.giphy.com/media/coxQHKASG60HrHtvkt/giphy.gif",
+            ],
+            "musica": [
+                "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
+                "https://media.giphy.com/media/3o7aD2saTPkJO7XONK/giphy.gif",
+            ],
+            "feliz": [
+                "https://media.giphy.com/media/3o72FfM5HJydzafgUE/giphy.gif",
+                "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
             ]
         }
         
@@ -307,6 +365,7 @@ async def buscar_gif(tema):
                 print(f"✅ GIF temático encontrado: {categoria}")
                 return random.choice(gifs)
         
+        # Fallback para GIFs genéricos
         gifs_fallback = [
             "https://media.giphy.com/media/3o7aD2saTPkJO7XONK/giphy.gif",
             "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
@@ -416,7 +475,7 @@ async def ping(ctx):
 async def ajuda(ctx):
     embed = discord.Embed(title=f"🤖 {personalidade['nome']} - Comandos", color=0x00ff00)
     embed.add_field(name="⚙️ BÁSICOS", value="`!ping`, `!ajuda`, `!info`", inline=False)
-    embed.add_field(name="🎵 MÚSICA", value="`!play`, `!skip`, `!stop`, `!fila`, `!relacionadas on/off`", inline=False)
+    embed.add_field(name="🎵 MÚSICA", value="`!play`, `!skip`, `!stop`, `!fila`, `!relacionadas on/off`, `!sair`", inline=False)
     embed.add_field(name="🛡️ MODERAÇÃO", value="`!clear`, `!expulsar`, `!banir`", inline=False)
     embed.add_field(name="🖼️ MÍDIA", value="`!imagem`, `!gif`", inline=False)
     embed.add_field(name="💬 IA", value="Me marque + sua pergunta", inline=False)
@@ -462,31 +521,52 @@ async def banir(ctx, membro: discord.Member, *, motivo="Motivo não especificado
     except Exception as e:
         await ctx.send(f"❌ Erro ao banir: {e}")
 
-# ========= COMANDOS DE MÚSICA =========
+# ========= COMANDOS DE MÚSICA CORRIGIDOS =========
 @bot.command(name='play')
 async def play(ctx, *, query):
     user_info = tratar_usuario_especial(ctx.author.id, ctx.author.name)
+    
+    # VALIDAÇÃO DE CANAL DE VOZ
     if not ctx.author.voice:
         await ctx.send(aplicar_estilo_completo("❌ Entra num canal de voz!", user_info))
         return
+    
+    # VALIDAÇÃO DE QUERY VAZIA
+    if not query or query.strip() == "":
+        await ctx.send(aplicar_estilo_completo("❌ Diga qual música quer ouvir!", user_info))
+        return
+    
     try:
+        # CONECTAR AO CANAL DE VOZ
         voice_client = ctx.guild.voice_client
         if not voice_client: 
             voice_client = await ctx.author.voice.channel.connect()
         elif voice_client.channel != ctx.author.voice.channel: 
             await voice_client.move_to(ctx.author.voice.channel)
         
+        # PREPARAR QUERY PARA BUSCA (otimizada para músicas)
+        if not query.startswith(('http', 'ytsearch:')):
+            query = f"ytsearch:{query} official music"
+        
+        # INICIALIZAR FILA SE NECESSÁRIO
         if ctx.guild.id not in fila_musica: 
             fila_musica[ctx.guild.id] = []
+        
+        # BUSCAR E ADICIONAR MÚSICA
+        mensagem_espera = await ctx.send(aplicar_estilo_completo("🔍 Buscando música...", user_info))
+        
         player = await YTDLSource.from_url(query, loop=bot.loop, stream=True)
         fila_musica[ctx.guild.id].append(player)
         
+        await mensagem_espera.edit(content=aplicar_estilo_completo(f"✅ **Adicionado:** {player.title}", user_info))
+        
+        # TOCAR SE NÃO ESTIVER TOCANDO
         if not voice_client.is_playing(): 
             await tocar_proxima(ctx, voice_client)
-        else: 
-            await ctx.send(f"🎵 **Na fila:** {player.title}")
+            
     except Exception as e: 
-        await ctx.send(aplicar_estilo_completo(f"❌ Erro: {e}", user_info))
+        print(f"❌ Erro no comando play: {e}")
+        await ctx.send(aplicar_estilo_completo(f"❌ Erro ao tocar música! Tente outro nome ou link.", user_info))
 
 @bot.command(name='skip') 
 async def skip(ctx):
@@ -509,7 +589,26 @@ async def stop(ctx):
         tocando_relacionadas[guild_id] = []
     if voice_client: 
         voice_client.stop()
-    await ctx.send(aplicar_estilo_completo("⏹️ Parando tudo!", user_info))
+    await ctx.send(aplicar_estilo_completo("⏹️ Parando tudo e limpando fila!", user_info))
+
+@bot.command(name='sair')
+@commands.has_permissions(administrator=True)
+async def sair(ctx):
+    """Desconecta o bot do canal de voz e limpa tudo"""
+    user_info = tratar_usuario_especial(ctx.author.id, ctx.author.name)
+    
+    guild_id = ctx.guild.id
+    if guild_id in fila_musica:
+        fila_musica[guild_id].clear()
+    if guild_id in tocando_relacionadas:
+        tocando_relacionadas[guild_id] = []
+    
+    voice_client = ctx.guild.voice_client
+    if voice_client:
+        await voice_client.disconnect()
+        await ctx.send(aplicar_estilo_completo("👋 Saindo do canal de voz!", user_info))
+    else:
+        await ctx.send(aplicar_estilo_completo("❌ Não estou em nenhum canal de voz!", user_info))
 
 @bot.command(name='fila')
 async def fila(ctx):
@@ -532,12 +631,13 @@ async def relacionadas(ctx, modo: str):
     if modo.lower() == 'on':
         voice_client = ctx.guild.voice_client
         if voice_client and voice_client.is_playing() and hasattr(voice_client.source, 'title'):
+            await ctx.send(aplicar_estilo_completo("🔍 Buscando músicas relacionadas...", user_info))
             musicas = await buscar_musicas_relacionadas(voice_client.source.title)
             if musicas: 
                 tocando_relacionadas[guild_id] = [m['url'] for m in musicas if m.get('url')]
-                await ctx.send(aplicar_estilo_completo("🔀 Modo Relacionadas Ativo!", user_info))
+                await ctx.send(aplicar_estilo_completo(f"✅ Modo Relacionadas Ativo! {len(musicas)} músicas encontradas.", user_info))
             else: 
-                await ctx.send(aplicar_estilo_completo("❌ Nada encontrado!", user_info))
+                await ctx.send(aplicar_estilo_completo("❌ Nenhuma música relacionada encontrada!", user_info))
         else: 
             await ctx.send(aplicar_estilo_completo("❌ Nada tocando!", user_info))
     elif modo.lower() == 'off':
@@ -613,9 +713,12 @@ async def gif(ctx, *, tema):
 async def on_message(message):
     if message.author == bot.user: 
         return
+    
+    # PROCESSAR COMANDOS PRIMEIRO
     await bot.process_commands(message)
-
-    if bot.user in message.mentions:
+    
+    # DEPOIS VERIFICAR MENCIONES (apenas se não for comando)
+    if bot.user in message.mentions and not message.content.startswith(PREFIX):
         pergunta = message.content.replace(f'<@{bot.user.id}>', '').strip()
         user_info = tratar_usuario_especial(message.author.id, message.author.name)
         
